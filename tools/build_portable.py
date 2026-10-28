@@ -1,0 +1,112 @@
+"""Build a Windows x64 portable release from hash-locked official downloads."""
+import argparse
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import urllib.request
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[1]
+DIRECTORIES = ("app", "tests", "docs", "tools", "examples")
+FILES = ("README.md", "README.txt", "AGENTS.md", "DEPLOY_WITH_AI.md", "LICENSE",
+         "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md", "THIRD_PARTY_NOTICES.md",
+         "requirements.txt", ".gitignore", ".gitattributes", "Launch.cmd", "Launch.ps1",
+         "StartServer.cmd", "StartServer.ps1", "ConfigureServer.ps1", "EnableLan.cmd",
+         "EnableLan.ps1", "InstallStartup.cmd", "InstallStartup.ps1", "ResetAccount.cmd",
+         "ServerConfig.example.json")
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def fetch(item, cache):
+    path = cache / item["filename"]
+    if path.name != item["filename"]:
+        raise ValueError("Invalid cache filename")
+    if not path.exists():
+        if not item["url"].startswith(("https://www.python.org/", "https://files.pythonhosted.org/")):
+            raise ValueError("Unexpected download host")
+        pending = path.with_name(path.name + ".pending")
+        with urllib.request.urlopen(item["url"], timeout=120) as response, pending.open("xb") as handle:
+            shutil.copyfileobj(response, handle)
+        if digest(pending) != item["sha256"]:
+            raise ValueError(f"Download SHA-256 mismatch: {path.name}")
+        pending.rename(path)
+    if digest(path) != item["sha256"]:
+        raise ValueError(f"Cache SHA-256 mismatch: {path.name}")
+    return path
+
+
+def extract(archive, destination):
+    with zipfile.ZipFile(archive) as handle:
+        for item in handle.infolist():
+            relative = PurePosixPath(item.filename)
+            if relative.is_absolute() or ".." in relative.parts or "\\" in item.filename or ":" in item.filename:
+                raise ValueError("Unsafe archive entry")
+            if (item.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError("Archive symlinks are not supported")
+        handle.extractall(destination)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "dist")
+    parser.add_argument("--cache", type=Path, default=ROOT / ".download-cache")
+    parser.add_argument("--no-samples", action="store_true", help="Skip fictional raster samples")
+    args = parser.parse_args()
+    version = re.search(r'^VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"', (ROOT / "app/app.py").read_text("utf-8"), re.M).group(1)
+    name = f"LongImageReview-v{version}-windows-x64"
+    output = args.output.resolve()
+    package = output / name
+    archive = output / (name + ".zip")
+    if package.exists() or archive.exists() or archive.with_suffix(".zip.sha256").exists():
+        parser.error("Output already exists; choose another output directory. Existing data is never removed.")
+    subprocess.run([__import__("sys").executable, str(ROOT / "tools/check_release.py")], cwd=ROOT, check=True)
+    cache = args.cache.resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    lock = json.loads((ROOT / "tools/distribution-lock.json").read_text("utf-8"))
+    downloads = [(item, fetch(item, cache)) for item in [lock["python"], *lock["wheels"]]]
+    package.mkdir(parents=True)
+    for folder in DIRECTORIES:
+        shutil.copytree(ROOT / folder, package / folder, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+    for filename in FILES:
+        shutil.copy2(ROOT / filename, package / filename)
+    for source, alias in (("Launch.cmd", "启动校样.cmd"), ("StartServer.cmd", "启动办公室服务器.cmd"), ("EnableLan.cmd", "允许办公室访问.cmd")):
+        shutil.copy2(package / source, package / alias)
+    runtime = package / "runtime"
+    extract(downloads[0][1], runtime)
+    pth = list(runtime.glob("python*._pth"))
+    if len(pth) != 1:
+        raise ValueError("Expected one embedded Python path configuration")
+    zipname = pth[0].stem + ".zip"
+    pth[0].write_text(f"{zipname}\n.\n..\\vendor\n..\\app\n", encoding="utf-8")
+    for _, wheel in downloads[1:]:
+        extract(wheel, package / "vendor")
+    if not args.no_samples:
+        if __import__("sys").platform != "win32":
+            parser.error("Fictional samples require Windows; use --no-samples on other build hosts.")
+        subprocess.run([str(runtime / "python.exe"), "-B", str(package / "tests/fixtures.py"), "--samples", str(package / "Samples")], cwd=package, check=True)
+    files = sorted(p for p in package.rglob("*") if p.is_file())
+    if any("__pycache__" in p.parts or p.suffix in {".pyc", ".pyo"} for p in files):
+        raise ValueError("Unexpected generated bytecode in release")
+    manifest = package / "SHA256SUMS.txt"
+    manifest.write_text("".join(digest(p) + "  " + p.relative_to(package).as_posix() + "\n" for p in files), encoding="utf-8")
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as handle:
+        for path in files + [manifest]:
+            handle.write(path, path.relative_to(output))
+    value = digest(archive)
+    archive.with_suffix(".zip.sha256").write_text(value + "  " + archive.name + "\n", encoding="utf-8")
+    print(json.dumps({"version": version, "archive": str(archive), "bytes": archive.stat().st_size,
+                      "sha256": value, "files": len(files) + 1}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
